@@ -3,7 +3,7 @@ import http from "http";
 import path from "path";
 import childProcess from "child_process";
 import { AddressInfo } from "net";
-import { pathToFileURL } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import {
   _electron as electron,
   ElectronApplication,
@@ -72,12 +72,11 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     packageDirectory,
     `${productIdentity.packageName}.exe`,
   );
-  const applicationEntryUrl = pathToFileURL(
-    path.join(
-      packageDirectory,
-      "resources", "app", ".webpack", "renderer", "main_window", "index.html",
-    ),
-  ).href;
+  const applicationEntryPath = path.resolve(
+    packageDirectory,
+    "resources", "app", ".webpack", "renderer", "main_window", "index.html",
+  );
+  const applicationEntryUrl = pathToFileURL(applicationEntryPath).href;
 
   expect(fs.statSync(executablePath).isFile()).toBe(true);
   expect(fs.existsSync(`${executablePath}.sig`)).toBe(false);
@@ -152,7 +151,18 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
       .poll(() => {
         const windows = launchedApplication.windows();
         windows.forEach(observeWindow);
-        mainWindow = windows.find((page) => page.url() === applicationEntryUrl);
+        mainWindow = windows.find((page) => {
+          try {
+            const url = new URL(page.url());
+            // Chromium and Node can serialize the same path differently (~/%7E).
+            return (
+              url.protocol === "file:" &&
+              fileURLToPath(url) === applicationEntryPath
+            );
+          } catch {
+            return false;
+          }
+        });
         return mainWindow !== undefined;
       }, {
         timeout: 30_000,
@@ -296,6 +306,7 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
       "Packaged smoke failure diagnostics:",
       JSON.stringify({
         expectedApplicationUrl: applicationEntryUrl,
+        expectedApplicationPath: applicationEntryPath,
         observedWindowUrls: [...observedWindowUrls],
         currentWindowUrls: application?.windows().map((page) => page.url()) ?? [],
         processErrors,
