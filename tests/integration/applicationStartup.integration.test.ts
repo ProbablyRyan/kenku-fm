@@ -1,4 +1,5 @@
 import type { BrowserWindow, IpcMainInvokeEvent } from "electron";
+import path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { createVersionHandler } from "../../src/dungeonJockey/main/applicationIpc";
 import {
@@ -14,13 +15,20 @@ const state = vi.hoisted(() => ({
   rootConstruct: vi.fn(),
   rootRefresh: vi.fn(),
   rootDispose: vi.fn(),
+  order: [] as string[],
+  protocolHandle: vi.fn(),
+  registerSchemes: vi.fn(),
 }));
 
 vi.mock("electron", async () => {
   const { EventEmitter } = await import("events");
+  const defaultSession = {
+    webRequest: { onBeforeSendHeaders: vi.fn() },
+    protocol: { handle: state.protocolHandle },
+  };
   class WindowMock extends EventEmitter {
     webContents = Object.assign(new EventEmitter(), {
-      session: {},
+      session: defaultSession,
       mainFrame: { parent: null as unknown, detached: false, url: "" },
       isDestroyed: () => false,
       getURL: () => this.webContents.mainFrame.url,
@@ -29,9 +37,11 @@ vi.mock("electron", async () => {
     });
     constructor(readonly options: unknown) {
       super();
+      state.order.push("window");
       state.windows.push(this as unknown as BrowserWindow);
     }
     loadURL(url: string) {
+      state.order.push("load");
       this.webContents.emit("did-start-navigation", {
         isMainFrame: true,
         isSameDocument: false,
@@ -48,15 +58,24 @@ vi.mock("electron", async () => {
     app: Object.assign(new EventEmitter(), {
       isPackaged: false,
       requestSingleInstanceLock: () => true,
-      whenReady: () => Promise.resolve(),
+      whenReady: () => {
+        state.order.push("ready");
+        return Promise.resolve();
+      },
+      getAppPath: () => path.resolve("test-package"),
       getVersion: () => "1.5.5",
       quit: vi.fn(),
     }),
     BrowserWindow: WindowMock,
-    components: { whenReady: () => Promise.resolve(), status: () => ({}) },
-    session: {
-      defaultSession: { webRequest: { onBeforeSendHeaders: vi.fn() } },
+    components: {
+      whenReady: () => {
+        state.order.push("components");
+        return Promise.resolve();
+      },
+      status: () => ({}),
     },
+    session: { defaultSession },
+    protocol: { registerSchemesAsPrivileged: state.registerSchemes },
     shell: { openExternal: vi.fn() },
     powerSaveBlocker: { start: () => 1, stop: vi.fn() },
     ipcMain: {
@@ -112,6 +131,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   state.windows.length = 0;
   state.handlers.clear();
+  state.order.length = 0;
+  state.registerSchemes.mockImplementation(() => state.order.push("scheme"));
+  state.protocolHandle.mockImplementation(() => state.order.push("handler"));
   vi.stubGlobal(
     "MAIN_WINDOW_WEBPACK_ENTRY",
     "http://localhost:3000/main_window",
@@ -127,13 +149,30 @@ afterEach(async () => {
 });
 
 describe("application startup IPC wiring", () => {
-  it.each(["dungeon-jockey", "legacy-kenku"])(
-    "guards version in %s development windows across reload",
-    async (route) => {
+  it.each([
+    ["dungeon-jockey", false],
+    ["legacy-kenku", false],
+    ["dungeon-jockey", true],
+  ] as const)(
+    "guards version in %s windows (packaged=%s) across reload",
+    async (route, packaged) => {
+      const electron = await import("electron");
+      Object.defineProperty(electron.app, "isPackaged", { value: packaged, configurable: true });
       vi.stubEnv("DUNGEON_JOCKEY_STARTUP_ROUTE", route);
       await import("../../src/index");
       await vi.waitFor(() => expect(state.windows).toHaveLength(1));
       const window = state.windows[0];
+      const entry = packaged ? "dungeon-jockey://app/index.html" : "http://localhost:3000/main_window";
+      expect(window.webContents.getURL()).toBe(entry);
+      expect(state.order).toEqual(packaged
+        ? ["scheme", "ready", "components", "handler", "window", "load"]
+        : ["scheme", "ready", "components", "window", "load"]);
+      const { session } = await import("electron");
+      expect(window.webContents.session).toBe(session.defaultSession);
+      expect(state.protocolHandle).toHaveBeenCalledTimes(packaged ? 1 : 0);
+      if (packaged) {
+        expect(state.protocolHandle).toHaveBeenCalledWith("dungeon-jockey", expect.any(Function));
+      }
       expect(
         (window as unknown as { options: { webPreferences: unknown } }).options
           .webPreferences,
@@ -158,7 +197,7 @@ describe("application startup IPC wiring", () => {
           },
         );
       expect(read()).toMatchObject({ ok: true, version: "1.5.5" });
-      window.loadURL("http://localhost:3000/main_window");
+      window.loadURL(entry);
       expect(state.handlers.get(VERSION_CHANNEL)).toBe(handler);
       expect(read()).toMatchObject({ ok: true, version: "1.5.5" });
       if (route === "legacy-kenku") {

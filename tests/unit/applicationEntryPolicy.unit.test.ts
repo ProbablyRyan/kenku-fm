@@ -5,20 +5,26 @@ import {
 } from "../../src/dungeonJockey/main/applicationEntryPolicy";
 
 describe("application entry policy", () => {
-  const entry = "file:///C:/Dungeon%20Jockey/renderer/main_window/index.html";
+  const entry = "dungeon-jockey://app/index.html";
   const policy = createApplicationEntryPolicy(entry, true);
 
-  it("compares canonical parsed file identity and permits document fragments", () => {
+  it("compares the exact owned document identity and permits document fragments", () => {
     expect(policy.allows(entry)).toBe(true);
     expect(policy.allows(`${entry}#settings`)).toBe(true);
     expect(
       policy.allows(
-        "file:///C:/Dungeon%20Jockey/renderer/main_window/./index.html",
+        "dungeon-jockey://app/./index.html",
       ),
     ).toBe(true);
   });
 
   it.each([
+    "file:///C:/Dungeon%20Jockey/renderer/main_window/index.html",
+    "dungeon-jockey://other/index.html",
+    "dungeon-jockey://app:80/index.html",
+    "dungeon-jockey://user@app/index.html",
+    "dungeon-jockey://app/main_window/index.js",
+    "dungeon-jockey://app/player_window/index.html",
     `${entry}.evil`,
     `${entry}/child`,
     `${entry}?other`,
@@ -55,6 +61,15 @@ describe("application entry policy", () => {
   });
 
   it("fails closed on mismatched environment or invalid main-selected entries", () => {
+    for (const packagedEntry of [
+      "file:///C:/app/index.html",
+      "dungeon-jockey://other/index.html",
+      "dungeon-jockey://app/other.html",
+      `${entry}?other`,
+      `${entry}#settings`,
+    ]) {
+      expect(() => createApplicationEntryPolicy(packagedEntry, true)).toThrow();
+    }
     expect(() =>
       createApplicationEntryPolicy("https://localhost/app", true),
     ).toThrow();

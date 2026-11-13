@@ -1,4 +1,5 @@
 import os from "os";
+import path from "path";
 import {
   app,
   BrowserWindow,
@@ -7,6 +8,7 @@ import {
   shell,
   ipcMain,
   powerSaveBlocker,
+  protocol,
 } from "electron";
 import { configureApplicationProfile } from "./applicationProfile";
 import { getMalformedUserAgent, getUserAgent } from "./main/userAgent";
@@ -17,11 +19,17 @@ import { createDungeonJockeyCompositionRoot } from "./dungeonJockey/main/composi
 import { selectStartupRoute } from "./dungeonJockey/main/startupRoute";
 import { createApplicationIpc } from "./dungeonJockey/main/applicationIpc";
 import { createApplicationEntryPolicy } from "./dungeonJockey/main/applicationEntryPolicy";
+import {
+  APPLICATION_ENTRY,
+  installApplicationProtocol,
+  registerApplicationScheme,
+} from "./dungeonJockey/main/applicationProtocol";
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
 
 const applicationProfile = configureApplicationProfile();
+registerApplicationScheme(protocol);
 configureApplicationMenu();
 console.log(
   `application profile ready: ${applicationProfile.mode} (${applicationProfile.userDataPath})`,
@@ -30,6 +38,9 @@ console.log(
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 let window: BrowserWindow | null = null;
 let applicationIpc: ReturnType<typeof createApplicationIpc>;
+const applicationEntry = app.isPackaged
+  ? APPLICATION_ENTRY
+  : MAIN_WINDOW_WEBPACK_ENTRY;
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 // This CommonJS package eagerly evaluates Squirrel startup arguments at load time;
@@ -68,7 +79,7 @@ const createWindow = (): BrowserWindow => {
 
   applicationIpc.bindApplicationWindow(
     mainWindow.webContents,
-    createApplicationEntryPolicy(MAIN_WINDOW_WEBPACK_ENTRY, app.isPackaged),
+    createApplicationEntryPolicy(applicationEntry, app.isPackaged),
     (url) => {
       void shell.openExternal(url).catch((): void => {});
     },
@@ -112,7 +123,7 @@ const createWindow = (): BrowserWindow => {
   saveWindowBounds(mainWindow);
 
   // Install identity, navigation and session lifecycle hooks before loading UI.
-  mainWindow.loadURL(MAIN_WINDOW_WEBPACK_ENTRY);
+  mainWindow.loadURL(applicationEntry);
 
   return mainWindow;
 };
@@ -147,6 +158,14 @@ if (!hasSingleInstanceLock) {
       console.error("components failed to load:", JSON.stringify(e, null, 2));
     }
 
+    if (app.isPackaged) {
+      // BrowserWindow uses defaultSession. Install once, after profile setup and
+      // CastLabs readiness, before creating or loading any application window.
+      installApplicationProtocol(
+        session.defaultSession,
+        path.join(app.getAppPath(), ".webpack", "renderer", "main_window"),
+      );
+    }
     applicationIpc = createApplicationIpc(ipcMain, () => app.getVersion());
     window = createWindow();
 
