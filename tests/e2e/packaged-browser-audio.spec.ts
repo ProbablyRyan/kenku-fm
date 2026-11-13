@@ -3,14 +3,17 @@ import http from "http";
 import path from "path";
 import childProcess from "child_process";
 import { AddressInfo } from "net";
+import { fileURLToPath, pathToFileURL } from "url";
 import {
   _electron as electron,
   ElectronApplication,
+  Page,
   expect,
   test,
 } from "@playwright/test";
 
 import productIdentity from "../../product-identity.json";
+import packageMetadata from "../../package.json";
 
 type ProbeFacts = {
   pcmFrameCount: number;
@@ -69,6 +72,11 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     packageDirectory,
     `${productIdentity.packageName}.exe`,
   );
+  const applicationEntryPath = path.resolve(
+    packageDirectory,
+    "resources", "app", ".webpack", "renderer", "main_window", "index.html",
+  );
+  const applicationEntryUrl = pathToFileURL(applicationEntryPath).href;
 
   expect(fs.statSync(executablePath).isFile()).toBe(true);
   expect(fs.existsSync(`${executablePath}.sig`)).toBe(false);
@@ -91,6 +99,10 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
   const fixture = await serveFixture();
   const processErrors: string[] = [];
   const rendererErrors: string[] = [];
+  const mainConsoleErrors: string[] = [];
+  const rendererConsoleErrors: string[] = [];
+  const observedWindowUrls = new Set<string>();
+  const observedWindows = new Set<Page>();
   let application: ElectronApplication | undefined;
   let cleanExitCode: number | null = null;
 
@@ -107,12 +119,56 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     launchedApplication.process().stderr?.on("data", (chunk) => {
       processErrors.push(String(chunk));
     });
-    launchedApplication.on("window", (page) => {
-      page.on("crash", () => rendererErrors.push("renderer crashed"));
-      page.on("pageerror", (error) => rendererErrors.push(error.message));
+    launchedApplication.on("console", (message) => {
+      if (message.type() === "error") mainConsoleErrors.push(message.text());
     });
+    const observeWindow = (page: Page) => {
+      if (observedWindows.has(page)) return;
+      observedWindows.add(page);
+      observedWindowUrls.add(page.url());
+      page.on("framenavigated", (frame) => {
+        if (frame === page.mainFrame()) observedWindowUrls.add(frame.url());
+      });
+      page.on("crash", () =>
+        rendererErrors.push(`${page.url()}: renderer crashed`),
+      );
+      page.on("pageerror", (error) =>
+        rendererErrors.push(`${page.url()}: ${error.message}`),
+      );
+      page.on("console", (message) => {
+        if (message.type() === "error") {
+          rendererConsoleErrors.push(`${page.url()}: ${message.text()}`);
+        }
+      });
+    };
+    launchedApplication.on("window", observeWindow);
+    launchedApplication.windows().forEach(observeWindow);
 
-    const mainWindow = await launchedApplication.firstWindow();
+    // Hidden capture windows can load before the application UI. Poll current
+    // pages as well as newly created ones, including pages initially about:blank.
+    let mainWindow: Page | undefined;
+    await expect
+      .poll(() => {
+        const windows = launchedApplication.windows();
+        windows.forEach(observeWindow);
+        mainWindow = windows.find((page) => {
+          try {
+            const url = new URL(page.url());
+            // Chromium and Node can serialize the same path differently (~/%7E).
+            return (
+              url.protocol === "file:" &&
+              fileURLToPath(url) === applicationEntryPath
+            );
+          } catch {
+            return false;
+          }
+        });
+        return mainWindow !== undefined;
+      }, {
+        timeout: 30_000,
+        message: `Waiting for packaged application entry: ${applicationEntryUrl}`,
+      })
+      .toBe(true);
     await expect(mainWindow.getByRole("button", { name: "add tab" })).toBeVisible();
     await expect(mainWindow.getByLabel("Dungeon Jockey temporary mark")).toBeVisible();
     await expect(mainWindow.getByText("Oops, something went wrong..")).toHaveCount(0);
@@ -130,6 +186,39 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
       userData: profilePath,
     });
 
+    // Exercise the real isolated preload and guarded main handler on both
+    // documents, not a main-process shortcut to app.getVersion().
+    for (const reload of [false, true]) {
+      if (reload) {
+        await mainWindow.reload();
+        await expect(
+          mainWindow.getByRole("button", { name: "add tab" }),
+        ).toBeVisible();
+      }
+      const versionResult = await mainWindow.evaluate(() =>
+        window.dungeonJockey.getVersion(),
+      );
+      expect(versionResult).toEqual({
+        ok: true,
+        protocolVersion: 1,
+        id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        version: packageMetadata.version,
+      });
+      expect(
+        await mainWindow.evaluate(() => Object.keys(window.dungeonJockey)),
+      ).toEqual(["getVersion"]);
+      expect(await mainWindow.evaluate(() => "version" in window.kenku)).toBe(
+        false,
+      );
+      await mainWindow.getByTestId("SettingsRoundedIcon").click();
+      await expect(
+        mainWindow.getByText(`v${packageMetadata.version}`, { exact: true }),
+      ).toBeVisible();
+      await mainWindow
+        .getByRole("button", { name: "Done", exact: true })
+        .click();
+    }
+
     await mainWindow.getByRole("button", { name: "add tab" }).click();
     const urlInput = mainWindow.getByRole("textbox", { name: "enter a URL" });
     await expect(urlInput).toBeVisible();
@@ -146,6 +235,18 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
         ),
       )
       .toBe(true);
+
+    const fixtureHasOwnedBridge = await launchedApplication.evaluate(
+      async ({ webContents }, fixtureUrl) => {
+        const contents = webContents
+          .getAllWebContents()
+          .find((item) => item.getURL() === fixtureUrl);
+        if (!contents) throw new Error("loopback fixture tab was not found");
+        return contents.executeJavaScript("'dungeonJockey' in window");
+      },
+      fixture.url,
+    );
+    expect(fixtureHasOwnedBridge).toBe(false);
 
     await launchedApplication.evaluate(() => {
       const surface = (
@@ -199,6 +300,23 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
         silentFacts,
       }),
     );
+  } catch (error) {
+    // Print before cleanup: the runner removes temporary Playwright artifacts.
+    console.error(
+      "Packaged smoke failure diagnostics:",
+      JSON.stringify({
+        expectedApplicationUrl: applicationEntryUrl,
+        expectedApplicationPath: applicationEntryPath,
+        observedWindowUrls: [...observedWindowUrls],
+        currentWindowUrls: application?.windows().map((page) => page.url()) ?? [],
+        processErrors,
+        mainConsoleErrors,
+        rendererErrors,
+        rendererConsoleErrors,
+        failure: error instanceof Error ? error.stack : String(error),
+      }, null, 2),
+    );
+    throw error;
   } finally {
     if (application) {
       const applicationProcess = application.process();
