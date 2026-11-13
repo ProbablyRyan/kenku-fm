@@ -3,9 +3,11 @@ import http from "http";
 import path from "path";
 import childProcess from "child_process";
 import { AddressInfo } from "net";
+import { pathToFileURL } from "url";
 import {
   _electron as electron,
   ElectronApplication,
+  Page,
   expect,
   test,
 } from "@playwright/test";
@@ -70,6 +72,12 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     packageDirectory,
     `${productIdentity.packageName}.exe`,
   );
+  const applicationEntryUrl = pathToFileURL(
+    path.join(
+      packageDirectory,
+      "resources", "app", ".webpack", "renderer", "main_window", "index.html",
+    ),
+  ).href;
 
   expect(fs.statSync(executablePath).isFile()).toBe(true);
   expect(fs.existsSync(`${executablePath}.sig`)).toBe(false);
@@ -92,6 +100,10 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
   const fixture = await serveFixture();
   const processErrors: string[] = [];
   const rendererErrors: string[] = [];
+  const mainConsoleErrors: string[] = [];
+  const rendererConsoleErrors: string[] = [];
+  const observedWindowUrls = new Set<string>();
+  const observedWindows = new Set<Page>();
   let application: ElectronApplication | undefined;
   let cleanExitCode: number | null = null;
 
@@ -108,12 +120,45 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     launchedApplication.process().stderr?.on("data", (chunk) => {
       processErrors.push(String(chunk));
     });
-    launchedApplication.on("window", (page) => {
-      page.on("crash", () => rendererErrors.push("renderer crashed"));
-      page.on("pageerror", (error) => rendererErrors.push(error.message));
+    launchedApplication.on("console", (message) => {
+      if (message.type() === "error") mainConsoleErrors.push(message.text());
     });
+    const observeWindow = (page: Page) => {
+      if (observedWindows.has(page)) return;
+      observedWindows.add(page);
+      observedWindowUrls.add(page.url());
+      page.on("framenavigated", (frame) => {
+        if (frame === page.mainFrame()) observedWindowUrls.add(frame.url());
+      });
+      page.on("crash", () =>
+        rendererErrors.push(`${page.url()}: renderer crashed`),
+      );
+      page.on("pageerror", (error) =>
+        rendererErrors.push(`${page.url()}: ${error.message}`),
+      );
+      page.on("console", (message) => {
+        if (message.type() === "error") {
+          rendererConsoleErrors.push(`${page.url()}: ${message.text()}`);
+        }
+      });
+    };
+    launchedApplication.on("window", observeWindow);
+    launchedApplication.windows().forEach(observeWindow);
 
-    const mainWindow = await launchedApplication.firstWindow();
+    // Hidden capture windows can load before the application UI. Poll current
+    // pages as well as newly created ones, including pages initially about:blank.
+    let mainWindow: Page | undefined;
+    await expect
+      .poll(() => {
+        const windows = launchedApplication.windows();
+        windows.forEach(observeWindow);
+        mainWindow = windows.find((page) => page.url() === applicationEntryUrl);
+        return mainWindow !== undefined;
+      }, {
+        timeout: 30_000,
+        message: `Waiting for packaged application entry: ${applicationEntryUrl}`,
+      })
+      .toBe(true);
     await expect(mainWindow.getByRole("button", { name: "add tab" })).toBeVisible();
     await expect(mainWindow.getByLabel("Dungeon Jockey temporary mark")).toBeVisible();
     await expect(mainWindow.getByText("Oops, something went wrong..")).toHaveCount(0);
@@ -245,6 +290,22 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
         silentFacts,
       }),
     );
+  } catch (error) {
+    // Print before cleanup: the runner removes temporary Playwright artifacts.
+    console.error(
+      "Packaged smoke failure diagnostics:",
+      JSON.stringify({
+        expectedApplicationUrl: applicationEntryUrl,
+        observedWindowUrls: [...observedWindowUrls],
+        currentWindowUrls: application?.windows().map((page) => page.url()) ?? [],
+        processErrors,
+        mainConsoleErrors,
+        rendererErrors,
+        rendererConsoleErrors,
+        failure: error instanceof Error ? error.stack : String(error),
+      }, null, 2),
+    );
+    throw error;
   } finally {
     if (application) {
       const applicationProcess = application.process();
