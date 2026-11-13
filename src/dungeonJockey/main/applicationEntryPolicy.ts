@@ -1,3 +1,5 @@
+import { APPLICATION_ENTRY } from "./applicationProtocol";
+
 export interface ApplicationEntryPolicy {
   allows(url: string): boolean;
 }
@@ -12,15 +14,15 @@ export function createApplicationEntryPolicy(
     expected.password ||
     expected.hash ||
     (isPackaged
-      ? expected.protocol !== "file:"
+      ? entry !== APPLICATION_ENTRY
       : !["http:", "https:"].includes(expected.protocol))
   ) {
     throw new Error("Invalid application entry policy");
   }
 
-  // A file origin is shared by unrelated documents. Pin parsed URL components,
-  // including the document path, rather than trusting that origin or a prefix.
-  // Development pins its active origin separately from its entry path as well.
+  // Pin the owned document, not every document sharing its origin. Node's URL
+  // parser reports a null origin for custom schemes, so protocol/host/path are
+  // checked explicitly. Development also pins the exact active document.
   return Object.freeze({
     allows(url: string): boolean {
       try {

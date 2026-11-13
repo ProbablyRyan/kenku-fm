@@ -3,7 +3,6 @@ import http from "http";
 import path from "path";
 import childProcess from "child_process";
 import { AddressInfo } from "net";
-import { fileURLToPath, pathToFileURL } from "url";
 import {
   _electron as electron,
   ElectronApplication,
@@ -14,6 +13,7 @@ import {
 
 import productIdentity from "../../product-identity.json";
 import packageMetadata from "../../package.json";
+import { APPLICATION_CSP, APPLICATION_ENTRY } from "../../src/dungeonJockey/main/applicationProtocol";
 
 type ProbeFacts = {
   pcmFrameCount: number;
@@ -76,7 +76,7 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     packageDirectory,
     "resources", "app", ".webpack", "renderer", "main_window", "index.html",
   );
-  const applicationEntryUrl = pathToFileURL(applicationEntryPath).href;
+  const applicationEntryUrl = APPLICATION_ENTRY;
 
   expect(fs.statSync(executablePath).isFile()).toBe(true);
   expect(fs.existsSync(`${executablePath}.sig`)).toBe(false);
@@ -106,7 +106,7 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
   let application: ElectronApplication | undefined;
   let cleanExitCode: number | null = null;
 
-  try {
+  const launch = async () => {
     const launchedApplication = await electron.launch({
       executablePath,
       env: {
@@ -144,25 +144,18 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     launchedApplication.on("window", observeWindow);
     launchedApplication.windows().forEach(observeWindow);
 
+    return launchedApplication;
+  };
+
+  const findApplicationWindow = async (launchedApplication: ElectronApplication) => {
     // Hidden capture windows can load before the application UI. Poll current
     // pages as well as newly created ones, including pages initially about:blank.
     let mainWindow: Page | undefined;
     await expect
       .poll(() => {
         const windows = launchedApplication.windows();
-        windows.forEach(observeWindow);
-        mainWindow = windows.find((page) => {
-          try {
-            const url = new URL(page.url());
-            // Chromium and Node can serialize the same path differently (~/%7E).
-            return (
-              url.protocol === "file:" &&
-              fileURLToPath(url) === applicationEntryPath
-            );
-          } catch {
-            return false;
-          }
-        });
+        windows.forEach((page) => observedWindowUrls.add(page.url()));
+        mainWindow = windows.find((page) => page.url() === applicationEntryUrl);
         return mainWindow !== undefined;
       }, {
         timeout: 30_000,
@@ -172,6 +165,30 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     await expect(mainWindow.getByRole("button", { name: "add tab" })).toBeVisible();
     await expect(mainWindow.getByLabel("Dungeon Jockey temporary mark")).toBeVisible();
     await expect(mainWindow.getByText("Oops, something went wrong..")).toHaveCount(0);
+    return mainWindow;
+  };
+
+  const closeApplication = async () => {
+    if (!application) return;
+    const applicationProcess = application.process();
+    await application.close();
+    cleanExitCode = applicationProcess.exitCode;
+    application = undefined;
+    expect(cleanExitCode).toBe(0);
+  };
+
+  try {
+    const launchedApplication = await launch();
+    const mainWindow = await findApplicationWindow(launchedApplication);
+    expect(await mainWindow.evaluate(() => ({
+      origin: location.origin,
+      secure: isSecureContext,
+      scripts: Array.from(document.scripts, (script) => script.src),
+    }))).toEqual({
+      origin: "dungeon-jockey://app",
+      secure: true,
+      scripts: ["dungeon-jockey://app/main_window/index.js"],
+    });
 
     const runtimeIdentity = await launchedApplication.evaluate(({ app }) => ({
       appName: app.getName(),
@@ -186,11 +203,25 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
       userData: profilePath,
     });
 
+    // Change a harmless preference through the real Redux UI. Do not seed or
+    // copy a legacy persisted root (which could include credentials).
+    await mainWindow.getByTestId("SettingsRoundedIcon").click();
+    const multipleOutputs = mainWindow.getByRole("checkbox", { name: "Multiple Outputs", exact: true });
+    await expect(multipleOutputs).not.toBeChecked();
+    await multipleOutputs.check();
+    await mainWindow.getByRole("button", { name: "Done", exact: true }).click();
+    await expect.poll(() => readFixturePreferences(mainWindow)).toEqual({
+      multipleOutputsEnabled: true,
+      bookmarks: [],
+    });
+
     // Exercise the real isolated preload and guarded main handler on both
     // documents, not a main-process shortcut to app.getVersion().
     for (const reload of [false, true]) {
       if (reload) {
-        await mainWindow.reload();
+        const response = await mainWindow.reload();
+        expect(response?.status()).toBe(200);
+        expect(response?.headers()["content-security-policy"]).toBe(APPLICATION_CSP);
         await expect(
           mainWindow.getByRole("button", { name: "add tab" }),
         ).toBeVisible();
@@ -211,6 +242,7 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
         false,
       );
       await mainWindow.getByTestId("SettingsRoundedIcon").click();
+      await expect(multipleOutputs).toBeChecked();
       await expect(
         mainWindow.getByText(`v${packageMetadata.version}`, { exact: true }),
       ).toBeVisible();
@@ -235,6 +267,15 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
         ),
       )
       .toBe(true);
+
+    const fixtureTitle = "Dungeon Jockey browser audio fixture";
+    await expect(mainWindow.getByText(fixtureTitle, { exact: true })).toBeVisible();
+    await mainWindow.getByRole("button", { name: "bookmark", exact: true }).click();
+    const expectedPreferences = {
+      multipleOutputsEnabled: true,
+      bookmarks: [{ url: fixture.url, title: fixtureTitle }],
+    };
+    await expect.poll(() => readFixturePreferences(mainWindow)).toEqual(expectedPreferences);
 
     const fixtureHasOwnedBridge = await launchedApplication.evaluate(
       async ({ webContents }, fixtureUrl) => {
@@ -300,6 +341,32 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
         silentFacts,
       }),
     );
+
+    // Reload proves both Redux-persist slices rehydrate, then a clean process
+    // restart proves durability in the same isolated profile and owned origin.
+    await mainWindow.reload();
+    await expect(mainWindow.getByRole("button", { name: "add tab" })).toBeVisible();
+    await expect(mainWindow.getByText(fixtureTitle, { exact: true })).toBeVisible();
+    await expect.poll(() => readFixturePreferences(mainWindow)).toEqual(expectedPreferences);
+    await closeApplication();
+    const restartedApplication = await launch();
+    const restartedWindow = await findApplicationWindow(restartedApplication);
+    expect(await restartedApplication.evaluate(({ app }) => app.getPath("userData"))).toBe(profilePath);
+    await expect(restartedWindow.getByText(fixtureTitle, { exact: true })).toBeVisible();
+    await restartedWindow.getByTestId("SettingsRoundedIcon").click();
+    await expect(restartedWindow.getByRole("checkbox", { name: "Multiple Outputs", exact: true })).toBeChecked();
+    await expect(restartedWindow.getByText(`v${packageMetadata.version}`, { exact: true })).toBeVisible();
+    await expect.poll(() => readFixturePreferences(restartedWindow)).toEqual(expectedPreferences);
+    expect(await restartedWindow.evaluate(() => window.dungeonJockey.getVersion())).toMatchObject({
+      ok: true, version: packageMetadata.version,
+    });
+    expect(rendererErrors).toEqual([]);
+    expect(processErrors.join("")).not.toMatch(/fatal|uncaught|unhandled/i);
+    const applicationCspErrors = rendererConsoleErrors.filter((message) =>
+      message.startsWith(applicationEntryUrl) && /content.security.policy|violat.*directive/i.test(message),
+    );
+    expect(applicationCspErrors).toEqual([]);
+    console.log("Owned-origin settings and bookmarks survived reload and clean restart");
   } catch (error) {
     // Print before cleanup: the runner removes temporary Playwright artifacts.
     console.error(
@@ -318,18 +385,33 @@ test("packaged app captures non-silent PCM from a loopback browser fixture", asy
     );
     throw error;
   } finally {
-    if (application) {
-      const applicationProcess = application.process();
-      await application.close();
-      cleanExitCode = applicationProcess.exitCode;
+    try {
+      await closeApplication();
+    } finally {
+      await fixture.close();
     }
-    await fixture.close();
   }
 
   expect(cleanExitCode).toBe(0);
   expect(fs.existsSync(profilePath)).toBe(true);
   console.log(`Packaged application clean exit verified: ${cleanExitCode}`);
 });
+
+async function readFixturePreferences(page: Page) {
+  return page.evaluate(() => {
+    const root = JSON.parse(localStorage.getItem("persist:root") || "{}");
+    const settings = JSON.parse(root.settings || "{}");
+    const bookmarks = JSON.parse(root.bookmarks || "{}").bookmarks;
+    // Return only the harmless fixture fields, never credentials or whole state.
+    return {
+      multipleOutputsEnabled: settings.multipleOutputsEnabled,
+      bookmarks: bookmarks?.allIds.map((id: string) => ({
+        url: bookmarks.byId[id].url as string,
+        title: bookmarks.byId[id].title as string,
+      })) ?? [],
+    };
+  });
+}
 
 async function readProbe(application: Awaited<ReturnType<typeof electron.launch>>) {
   return application.evaluate(() => {

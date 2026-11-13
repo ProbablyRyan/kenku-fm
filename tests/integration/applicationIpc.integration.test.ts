@@ -12,7 +12,7 @@ import {
 } from "../../src/dungeonJockey/main/applicationIpc";
 import { RendererRoleRegistry } from "../../src/dungeonJockey/main/RendererRoleRegistry";
 
-const entry = "file:///C:/Dungeon%20Jockey/renderer/main_window/index.html";
+const entry = "dungeon-jockey://app/index.html";
 const policy = createApplicationEntryPolicy(entry, true);
 const id = "123e4567-e89b-42d3-a456-426614174000";
 const request = () => ({
@@ -128,7 +128,7 @@ describe("role-bound version IPC", () => {
         contents.mainFrame.detached = true;
         break;
       case "frame document":
-        contents.mainFrame.url = entry.replace("main_window", "player_window");
+        contents.mainFrame.url = entry.replace("index.html", "player_window/index.html");
         break;
       case "contents document":
         contents.url = `${entry}.evil`;
